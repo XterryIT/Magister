@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7.2-alpine
+    container_name: redis_brain
+    restart: always
+    ports:
+      # Map host port 6379 to container port 6379
+      - "6379:6379"
+    command: >
+      --requirepass MyAdmin123
+      --appendonly yes
+    volumes:
+      # Persist data even if container restarts
+      - redis_data:/data
+
+volumes:
+  redis_data:
