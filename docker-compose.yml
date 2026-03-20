@@ -8,9 +8,7 @@ services:
     ports:
       # Map host port 6379 to container port 6379
       - "6379:6379"
-    command: >
-      --requirepass MyAdmin123
-      --appendonly yes
+
     volumes:
       # Persist data even if container restarts
       - redis_data:/data
