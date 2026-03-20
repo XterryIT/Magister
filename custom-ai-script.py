@@ -1,4 +1,4 @@
-#!/var/ossec/framework/python/bin/pip3 python3
+#!/var/ossec/framework/python/bin/python3
 import sys
 import json
 import redis
