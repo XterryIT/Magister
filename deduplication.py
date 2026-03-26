@@ -30,7 +30,7 @@ if __name__ == "__main__":
     while True:
         # queue is position of our log in Redis, raw_log_string it is a log data
         queue_name, raw_log_string = r.brpop(ALERTS)
-        
+
         # Convert json to str
         sample_log = json.loads(raw_log_string)
 
@@ -49,7 +49,7 @@ if __name__ == "__main__":
 
         # ex sets an expire flag on key name for ex seconds, 
         # f set to True, set the value at key name to value only if it does not exist.
-        is_new_alert = r.set(name=dedup_key, value="1", ex=60, nx=True)
+        is_new_alert = r.set(name=dedup_key, value="1", ex=30, nx=True)
 
         if is_new_alert:
             bundle = convert_wazuh_to_stix(sample_log)
@@ -57,6 +57,7 @@ if __name__ == "__main__":
             print(bundle.serialize(indent=4))
 
         else:
+            print("#########duplicate!!!!!!!!")
             continue
 
 
