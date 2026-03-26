@@ -117,6 +117,10 @@ if __name__ == "__main__":
     r = redis.Redis(host='localhost', port=6379, decode_responses=True)
     log = r.rpop(ALERTS)
     sample_log = json.loads(log)
+
+    print("#"*50)
+    print("#"*50)
+    print(json.dumps(sample_log, indent=4))
     
     print("🔄 Starting Wazuh -> STIX 2.1 conversion...\n")
     bundle = convert_wazuh_to_stix(sample_log)
