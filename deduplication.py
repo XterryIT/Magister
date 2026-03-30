@@ -17,6 +17,7 @@ if __name__ == "__main__":
 
         r.ping()
 
+        print("Script is on !")
 
     except redis.exceptions.ConnectionError:
         print("Problems with connectivity")

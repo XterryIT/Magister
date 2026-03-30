@@ -110,23 +110,23 @@ def convert_wazuh_to_stix(raw_log_json):
     return stix_bundle
 
 # --- TESTING ---
-if __name__ == "__main__":
-    # Your test log
-    sample_log = None
+# if __name__ == "__main__":
+#     # Your test log
+#     sample_log = None
 
-    r = redis.Redis(host='localhost', port=6379, decode_responses=True)
-    log = r.rpop(ALERTS)
-    sample_log = json.loads(log)
+#     r = redis.Redis(host='localhost', port=6379, decode_responses=True)
+#     log = r.rpop(ALERTS)
+#     sample_log = json.loads(log)
 
-    print("#"*50)
-    print("#"*50)
-    print(json.dumps(sample_log, indent=4))
+#     print("#"*50)
+#     print("#"*50)
+#     print(json.dumps(sample_log, indent=4))
     
-    print("🔄 Starting Wazuh -> STIX 2.1 conversion...\n")
-    bundle = convert_wazuh_to_stix(sample_log)
+#     print("🔄 Starting Wazuh -> STIX 2.1 conversion...\n")
+#     bundle = convert_wazuh_to_stix(sample_log)
     
-    # Print pretty JSON. This is exactly what will fly into Neo4j!
-    print(bundle.serialize(indent=4))
+#     # Print pretty JSON. This is exactly what will fly into Neo4j!
+#     print(bundle.serialize(indent=4))
 
 
 # ALERTS = 'wazuh_raw_alerts'
