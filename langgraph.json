@@ -3,5 +3,5 @@
   "graphs": {
     "soc_agent": "./brain/graph.py:graph"
   },
-  "env": ".env"
+  "env": "./.env"
 }
