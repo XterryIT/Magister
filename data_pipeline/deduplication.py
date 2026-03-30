@@ -2,16 +2,12 @@ import redis
 import json
 import re
 from datetime import datetime
-from STIX_conversion import convert_wazuh_to_stix
+from data_pipeline.STIX_conversion import convert_wazuh_to_stix
 
 ALERTS = 'wazuh_raw_alerts'
 
-    
-    
 
-
-if __name__ == "__main__":
-
+def deduplication():
     try:
         r = redis.Redis(host='localhost', port=6379, decode_responses=True)
 
