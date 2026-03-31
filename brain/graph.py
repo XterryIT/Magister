@@ -12,15 +12,17 @@ import operator
 from langchain_ollama import ChatOllama
 from langchain_core.tools import tool
 
-
+@tool
 def add(a: int, b: int) -> int:
     """Adds two numbers together."""
     return a + b
 
+@tool
 def multiply(a: int, b: int) -> int:
     """Multiplies two numbers together."""
     return a * b
 
+@tool
 def divide(a: int, b: int) -> float:
     """Divides a by b."""
     return a / b
@@ -63,7 +65,7 @@ builder = StateGraph(MessagesState)
 
 # 2. Добавляем узлы (присваиваем функции строковое имя)
 builder.add_node("assistant", assistant)
-builder.add_node("tools", ToolNode) # Узел с твоими add/multiply
+builder.add_node("tools", ToolNode(tools)) # Узел с твоими add/multiply
 
 # 3. Настраиваем связи по ИМЕНАМ (строкам!)
 builder.add_edge(START, "assistant") # Вход в граф
