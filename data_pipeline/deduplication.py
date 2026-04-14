@@ -2,7 +2,7 @@ import redis
 import json
 import re
 from datetime import datetime
-from data_pipeline.STIX_conversion import convert_wazuh_to_stix
+from STIX_conversion import convert_wazuh_to_stix
 
 ALERTS = 'wazuh_raw_alerts'
 
@@ -51,10 +51,13 @@ def deduplication():
         if is_new_alert:
             bundle = convert_wazuh_to_stix(sample_log)
 
-            print(bundle.serialize(indent=4))
+            print(type(bundle))
+            # print(bundle.serialize(indent=4))
 
         else:
             print("#########duplicate!!!!!!!!")
             continue
 
 
+if __name__ == "__main__":
+    deduplication()
