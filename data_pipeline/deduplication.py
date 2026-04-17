@@ -51,7 +51,7 @@ def deduplication():
         if is_new_alert:
             bundle = convert_wazuh_to_stix(sample_log)
 
-            print(type(bundle))
+            print(bundle.serialize(indent=4))
             # print(bundle.serialize(indent=4))
 
         else:
