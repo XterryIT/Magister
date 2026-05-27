@@ -1,251 +1,115 @@
-# Базовые типы сообщений теперь живут в langchain_core
 import os
 import sys
-
-from langchain_core.messages import AnyMessage, SystemMessage, HumanMessage, ToolMessage
-from IPython.display import Image, display
-# TypedDict и Annotated остаются из стандартных библиотек
-from langgraph.graph import StateGraph, START, END
-from langgraph.prebuilt import ToolNode, tools_condition
-from typing_extensions import TypedDict, Annotated
-import operator
-
-# Модели и инструменты
-from langchain_ollama import ChatOllama
-from langchain_core.tools import tool
-
-import redis
 import json
-import re
-from datetime import datetime
+import time
+import redis
+from langchain_core.messages import SystemMessage, HumanMessage
 
+# Подтягиваем наши настройки и состояние
+from brain.state import IcedentAgentState
+from brain.config import r_client, llm, ALERTS_QUEUE, TIME_WINDOW_SEC, ALERT_THRESHOLD
 
-
-# --- ФИКС ПУТЕЙ ИМПОРТА ---
-# 1. Получаем абсолютный путь к текущему файлу (nodes.py)
-current_file_path = os.path.abspath(__file__)
-# 2. Получаем папку, в которой лежит этот файл (brain/)
-current_dir = os.path.dirname(current_file_path)
-# 3. Получаем родительскую папку (Magister/)
+# Костыль для импорта из соседних папок (STIX)
+current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_dir)
-# 4. Добавляем родительскую папку в системный путь Python
-sys.path.append(project_root)
+if project_root not in sys.path:
+    sys.path.append(project_root)
 
-# Теперь Python "видит" папку data_pipeline, и мы можем импортировать из неё
 from data_pipeline.STIX_conversion import convert_wazuh_to_stix
 
 
 
-ALERTS = 'wazuh_raw_alerts'
 
+def check_trigger(ip: str, level: int) -> bool:
+    """Логика умного триггера с использованием Redis"""
+    if not ip:
+        return False
+        
+    if level >= 10:
+        print(f"🔥 Триггер сработал: Критический уровень алерта ({level}) для IP {ip}!")
+        return True
 
-
-
-class State(TypedDict):
-    messages: Annotated[list[AnyMessage], operator.add]
-
+    redis_key = f"alert_history:{ip}"
+    current_time = time.time()
     
-
-llm = ChatOllama(
-    model="qwen3.5:9b",
-    validate_model_on_init=True,
-    temperature=0,
-)
-
-sys_mesage = SystemMessage(content = "You are the greatest cybersecurity threat analiser.")
-
-
-
-
-   
+    r_client.zadd(redis_key, {str(current_time): current_time})
+    r_client.zremrangebyscore(redis_key, 0, current_time - TIME_WINDOW_SEC)
+    alert_count = r_client.zcard(redis_key)
+    
+    if alert_count >= ALERT_THRESHOLD:
+        print(f"🔥 Триггер сработал: Накоплено {alert_count} алертов за 5 минут для IP {ip}!")
+        r_client.delete(redis_key)
+        return True
+        
+    return False
 
 
-def node_a(state: State) -> State:
 
+
+def extracting(state: IcedentAgentState):
     try:
-        r = redis.Redis(host='localhost', port=6379, decode_responses=True)
-
-        r.ping()
-
-        print("Script is on !")
-
+        r_client.ping()
     except redis.exceptions.ConnectionError:
-        print("Problems with connectivity")
+        return {"incedent": [], "messages": [], "escalate": False, "target_ip": ""}
 
-    except Exception as e:
-        print("something went wrong: {e}")
-
-
-
-    queue_name, raw_log_string = r.brpop(ALERTS)
-
-        # Convert json to str
+    queue_name, raw_log_string = r_client.brpop(ALERTS_QUEUE)
     sample_log = json.loads(raw_log_string)
+    log_data = json.loads(sample_log) if isinstance(sample_log, str) else sample_log
 
-        # Checks if log converted correctly
-    if isinstance(sample_log, str):
-        log_data = json.loads(sample_log)
-    else:
-        log_data = sample_log
-
-        # Extract id alert and victims IP 
     raw_id = log_data.get("rule", {}).get("id", None)
+    level = int(log_data.get("rule", {}).get("level", 0))
     raw_ip = log_data.get("agent", {}).get("ip", None)
         
-        # Foeming a dedup key, this key is need to compare with others keys and deleting duplicats 
     dedup_key = f"dedup:{raw_id}:{raw_ip}"
-
-        # ex sets an expire flag on key name for ex seconds, 
-        # f set to True, set the value at key name to value only if it does not exist.
-    is_new_alert = r.set(name=dedup_key, value="1", ex=30, nx=True)
+    is_new_alert = r_client.set(name=dedup_key, value="1", ex=30, nx=True)
 
     if is_new_alert:
+        needs_escalation = check_trigger(raw_ip, level)
         bundle = convert_wazuh_to_stix(sample_log)
-
-        print("#"*50)
-        print("THE STIX OBJECT")
-        print("#"*50)
-        print(bundle.serialize(indent=4))
-        print("#"*50)
-
-        return State(nlist=[bundle])
-
+        stix_json = bundle.serialize(indent=4)
+        
+        prompt_content = f"Проанализируй алерт:\n{stix_json}"
+            
+        return {
+            "incedent": [bundle], 
+            "messages": [HumanMessage(content=prompt_content)],
+            "escalate": needs_escalation,
+            "target_ip": raw_ip
+        }
     else:
-        print("#########duplicate!!!!!!!!")
+        return {"incedent": [], "messages": [], "escalate": False, "target_ip": ""}
 
+def analising(state: IcedentAgentState):
+    # Если нужна эскалация, L1 молчит
+    if state["escalate"]:
+        return {"report": ""}
 
-def node_b(state: State) -> State:
-    """LLM decides whether to call a tool or not"""
+    base_prompt = (
+        "Ты — старший аналитик SOC. Оцени алерт (True/False Positive). Не доверяй слепо уровню Wazuh.\n"
+        "ВАЖНО: Злоумышленники часто используют легитимные команды и рутинные запросы "
+        "(например, чтение системных файлов, базовые SQL-запросы) для разведки (Reconnaissance) и продвижения по сети (Lateral Movement).\n"
+        "Всегда оценивай контекст! Если легитимная команда исходит от нетипичного IP-адреса, направлена на критическую зону (Internal_zone) "
+        "или выглядит как попытка собрать информацию о системе — это часть атаки (True Positive).\n"
+    )
 
-    return {
-        "messages": [
-            llm.invoke(
-                [sys_mesage] + state["messages"]
-            )
-        ],
-        "llm_calls": state.get('llm_calls', 0) + 1
-    }
+    format_prompt = (
+        "Твой ответ ДОЛЖЕН СТРОГО соответствовать шаблону:\n\n"
+        "**Вердикт:** [True Positive или False Positive]\n"
+        "**Уверенность:** [XX%]\n"
+        "**Резюме инцидента:** [2-3 предложения, описывающие суть произошедшего]\n"
+        "**Матрица MITRE ATT&CK:** [Тактика и техника]\n"
+        "**Обоснование:** [3-4 предложения. Детально объясни логику: почему лог указывает на атаку или норму? Как это связано с топологией Neo4j? Упомяни конкретные данные из лога.]\n"
+        "**Действие:** [Конкретный шаг для реагирования]"
+    )
 
-
-
-builder = StateGraph(State)
-
-
-
-#Adding nodes 
-builder.add_node('a', node_a)
-builder.add_node('b', node_b)
-
-
-#Adding edges
-builder.add_edge(START,"a")
-builder.add_edge("a","b")
-builder.add_edge("b",END)
-
-
-graph = builder.compile()
-
-
-
-
-
-
-
-
-
-# # Базовые типы сообщений теперь живут в langchain_core
-# from langchain_core.messages import AnyMessage, SystemMessage, HumanMessage, ToolMessage
-
-# # TypedDict и Annotated остаются из стандартных библиотек
-# from langgraph.graph import StateGraph, START, END
-# from langgraph.prebuilt import ToolNode, tools_condition
-# from typing_extensions import TypedDict, Annotated
-# import operator
-
-
-# # Модели и инструменты
-# from langchain_ollama import ChatOllama
-# from langchain_core.tools import tool
-
-# @tool
-# def add(a: int, b: int) -> int:
-#     """Adds two numbers together."""
-#     return a + b
-
-# @tool
-# def multiply(a: int, b: int) -> int:
-#     """Multiplies two numbers together."""
-#     return a * b
-
-# @tool
-# def divide(a: int, b: int) -> float:
-#     """Divides a by b."""
-#     return a / b
-
-
-# tools = [add, multiply, divide]
-
-# llm = ChatOllama(
-#     model="qwen3.5:9b",
-#     validate_model_on_init=True,
-#     temperature=0,
-# ).bind_tools(tools)
-
-# sys_mesage = SystemMessage(content = "You a great teacher that can easyly do all math operations")
-
-
-# # Defining a State
-# class MessagesState(TypedDict):
-#     messages: Annotated[list[AnyMessage], operator.add]
-#     llm_calls: int
-
-
-# #The model node is used to call the LLM and decide whether to call a tool or not.
-
-# def assistant(state: MessagesState):
-#     """LLM decides whether to call a tool or not"""
-
-#     return {
-#         "messages": [
-#             llm.invoke(
-#                 [sys_mesage] + state["messages"]
-#             )
-#         ],
-#         "llm_calls": state.get('llm_calls', 0) + 1
-#     }
-
-
-# # 1. Создаем граф на основе твоего State
-# builder = StateGraph(MessagesState)
-
-# # 2. Добавляем узлы (присваиваем функции строковое имя)
-# builder.add_node("assistant", assistant)
-# builder.add_node("tools", ToolNode(tools)) # Узел с твоими add/multiply
-
-# # 3. Настраиваем связи по ИМЕНАМ (строкам!)
-# builder.add_edge(START, "assistant") # Вход в граф
-
-# # Условный переход: если ИИ вызвал инструмент - идем в "tools", иначе в END
-# builder.add_conditional_edges(
-#     "assistant",
-#     tools_condition, # Это стандартная функция из langgraph.prebuilt
-# )
-
-# builder.add_edge("tools", "assistant") # После инструментов возвращаемся к ИИ
-
-# # 4. КОМПИЛЯЦИЯ
-# graph = builder.compile()
-# print("✅ Граф успешно собран!")
-
-# print(graph)
-
-
-
-
-
-
-
-
-
-
-
+    sys_message = SystemMessage(content=base_prompt + format_prompt)
+    messages_to_send = [sys_message] + state["messages"]
+    
+    start_time = time.time()
+    response = llm.invoke(messages_to_send)
+    end_time = time.time()
+    
+    print(f"⏱️ L1 Triage занял: {(end_time-start_time):.2f} сек.")
+    print("-" * 50)
+    
+    return {"messages": [response], "report": response.content}
