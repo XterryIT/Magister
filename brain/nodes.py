@@ -5,20 +5,15 @@ import time
 import redis
 from langchain_core.messages import SystemMessage, HumanMessage
 
-# Подтягиваем наши настройки и состояние
-from brain.state import IcedentAgentState
-from brain.config import r_client, llm, ALERTS_QUEUE, TIME_WINDOW_SEC, ALERT_THRESHOLD
-
-# Костыль для импорта из соседних папок (STIX)
+# Добавляем корневую папку в пути для импортов (ВАЖНО!)
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_dir)
 if project_root not in sys.path:
     sys.path.append(project_root)
 
 from data_pipeline.STIX_conversion import convert_wazuh_to_stix
-
-
-
+from brain.state import IcedentAgentState
+from brain.config import r_client, llm, ALERTS_QUEUE, TIME_WINDOW_SEC, ALERT_THRESHOLD
 
 def check_trigger(ip: str, level: int) -> bool:
     """Логика умного триггера с использованием Redis"""
@@ -38,13 +33,10 @@ def check_trigger(ip: str, level: int) -> bool:
     
     if alert_count >= ALERT_THRESHOLD:
         print(f"🔥 Триггер сработал: Накоплено {alert_count} алертов за 5 минут для IP {ip}!")
-        r_client.delete(redis_key)
+        r_client.delete(redis_key) # Сбрасываем счетчик после срабатывания
         return True
         
     return False
-
-
-
 
 def extracting(state: IcedentAgentState):
     try:
@@ -80,29 +72,24 @@ def extracting(state: IcedentAgentState):
         return {"incedent": [], "messages": [], "escalate": False, "target_ip": ""}
 
 def analising(state: IcedentAgentState):
+    # Если лог отсеян как дубликат
+    if not state.get("messages"):
+        return {"report": ""}
+
     # Если нужна эскалация, L1 молчит
-    if state["escalate"]:
+    if state.get("escalate"):
         return {"report": ""}
 
     base_prompt = (
-        "Ты — старший аналитик SOC. Оцени алерт (True/False Positive). Не доверяй слепо уровню Wazuh.\n"
-        "ВАЖНО: Злоумышленники часто используют легитимные команды и рутинные запросы "
-        "(например, чтение системных файлов, базовые SQL-запросы) для разведки (Reconnaissance) и продвижения по сети (Lateral Movement).\n"
-        "Всегда оценивай контекст! Если легитимная команда исходит от нетипичного IP-адреса, направлена на критическую зону (Internal_zone) "
-        "или выглядит как попытка собрать информацию о системе — это часть атаки (True Positive).\n"
+        "Ты — AI-ассистент SOC (L1). Твоя задача — мгновенный триаж одиночных алертов.\n"
+        "Пиши МАКСИМАЛЬНО сжато. Используй строго заданный формат.\n"
+        "Формат:\n"
+        "🚨 **Вердикт:** [True/False Positive]\n"
+        "🔍 **Причина:** [СТРОГО 1-2 предложения по полю x_wazuh_full_log.]\n"
+        "🛡️ **Действие:** [3-5 слов.]"
     )
 
-    format_prompt = (
-        "Твой ответ ДОЛЖЕН СТРОГО соответствовать шаблону:\n\n"
-        "**Вердикт:** [True Positive или False Positive]\n"
-        "**Уверенность:** [XX%]\n"
-        "**Резюме инцидента:** [2-3 предложения, описывающие суть произошедшего]\n"
-        "**Матрица MITRE ATT&CK:** [Тактика и техника]\n"
-        "**Обоснование:** [3-4 предложения. Детально объясни логику: почему лог указывает на атаку или норму? Как это связано с топологией Neo4j? Упомяни конкретные данные из лога.]\n"
-        "**Действие:** [Конкретный шаг для реагирования]"
-    )
-
-    sys_message = SystemMessage(content=base_prompt + format_prompt)
+    sys_message = SystemMessage(content=base_prompt)
     messages_to_send = [sys_message] + state["messages"]
     
     start_time = time.time()

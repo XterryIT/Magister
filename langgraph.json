@@ -1,7 +1,7 @@
 {
   "dependencies": ["."],
   "graphs": {
-    "soc_agent": "./brain/graph.py:graph"
+    "soc_agent": "./brain/main.py:graph"
   },
   "env": "./.env"
 }

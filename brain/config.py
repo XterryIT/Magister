@@ -6,7 +6,7 @@ ALERTS_QUEUE = 'wazuh_raw_alerts'
 TIME_WINDOW_SEC = 300  # 5 минут
 ALERT_THRESHOLD = 4    # 4 алерта
 
-# Глобальное подключение к Redis
+# Подключение к Redis
 r_client = redis.Redis(host='localhost', port=6379, decode_responses=True)
 
 # Инициализация LLM (Модель для L1 Triage)
