@@ -28,7 +28,9 @@ from data_pipeline.STIX_conversion import convert_wazuh_to_stix
 ALERTS_QUEUE = 'wazuh_raw_alerts'
 TIME_WINDOW_SEC = 300  
 HISTORY_WINDOW_SEC = 900 
-ALERT_THRESHOLD = 4    
+ALERT_THRESHOLD = 4
+
+USE_NEO4J = True
 
 r_client = redis.Redis(host='localhost', port=6379, decode_responses=True)
 
@@ -186,12 +188,13 @@ def analising(state: IcedentAgentState):
 
     print("[L1] Performing quick noise filtration (Compute ROI check)...")
     base_prompt = (
-        "You are an L1 SOC AI Analyst. Your task is instant triage of a batch of alerts.\n"
-        "Respond in telegraphic style. DO NOT output thinking process. Output ONLY the final report.\n\n"
-        "Format:\n"
-        "Verdict: [True Positive / False Positive]\n"
-        "Reason: [1 short sentence based on logs]\n"
-        "Action: [Short recommendation]"
+        "You are an L1 SOC AI Analyst. Your goal is to triage an alert provided in STIX format.\n"
+        "RULE 1: Your final response MUST STRICTLY follow the Markdown format below, without unnecessary introductions:\n\n"
+        "Verdict: [Specify: True Positive (Actual threat) or False Positive (False alarm)]\n"
+        "Confidence Level: [Specify in percentage, e.g., 95%]\n"
+        "Incident Summary: [Describe the nature of the attack in 2-3 sentences in plain language, using data from the alert]\n"
+        "MITRE ATT&CK Matrix: [Specify tactic and technique, e.g., Initial Access -> Privilege Escalation]\n"
+        "Containment Recommendation: [Specify concrete actions, e.g., 'Isolate host VM1', 'Block IP', or 'Close as background noise']"
     )
 
     sys_message = SystemMessage(content=base_prompt)
@@ -314,15 +317,25 @@ def context_aggregator(state: IcedentAgentState):
 # ==========================================
 # STAGE 4: AGENTS (HUNTER & SKEPTIC)
 # ==========================================
+
 def hunter_agent(state: IcedentAgentState):
     print("  ├── [L2-HUNTER] Prosecuting the incident (Building attack vector)...")
     hunter_prompt = (
-        "You are an L2 SOC Threat Hunter. Prove this STIX bundle represents a real attack.\n"
-        "Output ONLY the report without thinking steps.\n"
-        "Format:\n"
-        "Hunter Report:\n"
-        "* Attack Vector: [1 sentence]\n"
-        "* Evidence: [2 facts]"
+        "You are an L2 SOC Threat Hunter. Your goal is to prove this STIX bundle represents a real cyber attack.\n"
+        "Carefully read the occurrence counts and relationships in the STIX bundle.\n\n"
+        "INSTRUCTIONS:\n"
+        "1. Write your detailed internal thinking process in ENGLISH to ensure maximum logical accuracy.\n"
+        "2. Provide a comprehensive formal report in RUSSIAN.\n"
+        "3. Do not limit your facts. Include ALL relevant evidence, IPs, and attack patterns.\n\n"
+        "Format EXACTLY like this:\n\n"
+        "THINKING PROCESS:\n"
+        "[Your detailed step-by-step analysis in English. Analyze the IPs, frequency of events, and Kill Chain]\n\n"
+        "HUNTER REPORT:\n"
+        "Atack vector: [A detailed description of exactly how the attacker operates]\n"
+        "Evidence:\n"
+        "- [Fact 1: A description that includes specific figures and IP addresses]\n"
+        "- [Fact 2: ... list all the anomalies found]\n"
+        "Conclusion: [Final Conclusion]"
     )
     sys_message = SystemMessage(content=hunter_prompt)
     stix_msg = HumanMessage(content=f"STIX BUNDLE:\n{state.get('stix_bundle', '')}")
@@ -333,19 +346,27 @@ def hunter_agent(state: IcedentAgentState):
 def skeptic_agent(state: IcedentAgentState):
     print("  └── [L2-SKEPTIC] Defending the incident (Searching for False Positives)...")
     skeptic_prompt = (
-        "You are an L2 SOC Validation Analyst. Prove this STIX bundle is benign (False Positive).\n"
-        "Output ONLY the report without thinking steps.\n"
-        "Format:\n"
-        "Skeptic Report:\n"
-        "* Benign Explanation: [1 sentence]\n"
-        "* Mitigating Factors: [2 facts]"
+        "You are an L2 SOC Validation Analyst. Your goal is to prove this STIX bundle is a False Positive, benign activity, or system glitch.\n"
+        "Carefully read the occurrence counts and relationships in the STIX bundle.\n\n"
+        "INSTRUCTIONS:\n"
+        "1. Write your detailed internal thinking process in ENGLISH to ensure maximum logical accuracy.\n"
+        "2. Provide a comprehensive formal report in RUSSIAN.\n"
+        "3. Do not limit your arguments. Include ALL possible benign explanations for the observed behavior.\n\n"
+        "Format EXACTLY like this:\n\n"
+        "THINKING PROCESS:\n"
+        "[Your detailed step-by-step analysis in English. Look for misconfigurations, internal IPs, or normal system behaviors]\n\n"
+        "SKEPTIC REPORT:\n"
+        "Reasonable explanation: [A detailed explanation of why this might be the norm]\n"
+        "Mitigating factors:\n"
+        "- [Argument 1: The nature of the network, the absence of data theft, etc.]\n"
+        "- [Argument 2: ... list all the excuses]\n"
+        "Conclusion: [Final conclusion]"
     )
     sys_message = SystemMessage(content=skeptic_prompt)
     stix_msg = HumanMessage(content=f"STIX BUNDLE:\n{state.get('stix_bundle', '')}")
     
     response = llm.invoke([sys_message, stix_msg])
     return {"skeptic_report": response.content}
-
 # ==========================================
 # STAGE 5: JUDGE (GRAPHRAG RESOLUTION)
 # ==========================================
@@ -377,24 +398,31 @@ def judge_agent(state: IcedentAgentState):
     """
     messages_to_pass = [SystemMessage(content=context_prompt)] + judge_history
 
-    if not has_tool_message:
+    if not has_tool_message and USE_NEO4J:
         print(f"[L3-JUDGE] Requesting Neo4j context for IP {target_ip}...")
         # FORCE the LLM to call the tool to guarantee spatial context extraction
         llm_forced = llm.bind_tools(tools, tool_choice="check_network_topology")
         response = llm_forced.invoke(messages_to_pass)
         return {"messages": [response]}
     else:
-        print("[L3-JUDGE] Neo4j data received. Generating final verdict...")
+        if not USE_NEO4J:
+            print("[L3-JUDGE] Neo4j is DISABLED. Generating verdict without graph context...")
+        else:
+            print("[L3-JUDGE] Neo4j data received. Generating final verdict...")
+    
         # Clean final prompt enforcing Russian language
         final_prompt = (
-            "Review the Neo4j context and the agent reports. "
-            "Write the FINAL report strictly in RUSSIAN language.\n\n"
-            "Format:\n"
-            "Вердикт: [True Positive / False Positive]\n"
-            "Контекст Инфраструктуры: [1 предложение на основе Neo4j]\n"
-            "Обоснование: [Чьи аргументы победили?]\n"
-            "Действие: [Рекомендация]"
-        )
+                "Review the Neo4j context and the agent reports. "
+                "Write the FINAL report strictly in RUSSIAN language.\n\n"
+                "Format:\n"
+                "Verdict: [True Positive / False Positive]\n"
+                "Confidence: [Enter a percentage, e.g., 95%]\n"
+                "MITRE ATT&CK: [Describe the tactics and techniques, for example Initial Access - Brute Force]\n"
+                "Infrastructure Context: [few sentence based on Neo4j]!!!If you have an ACCESS if not wtrite you do not have access!!!\n"
+                "Justification: [Whose arguments prevailed, and why?]\n"
+                "Action: [Specific recommendation]"
+            )
+        
         messages_to_pass.append(HumanMessage(content=final_prompt))
         
         start_time = time.time()
@@ -475,14 +503,15 @@ if __name__ == "__main__":
                 print(">>> OFFICIAL INCIDENT REPORT (L3 JUDGE) <<<".center(70))
                 print("="*70)
                 print(final_state["messages"][-1].content)
-                print("="*70 + "\n")
-            
-            elif final_state.get("report"):
+                print("="*70)
+                
+                # Добавляем информативности: показываем скрытую работу агентов
                 print("\n" + "-"*70)
-                print(">>> NOISE FILTERED: L1 QUICK REPORT <<<".center(70))
-                print("-" * 70)
-                print(final_state["report"])
-                print("-" * 70 + "\n")
+                print("--- ИНВЕСТИГАЦИОННОЕ ДОСЬЕ (МАТЕРИАЛЫ АГЕНТОВ) ---".center(70))
+                print("-"*70)
+                print(f"[ПРОКУРОР / HUNTER]:\n{final_state.get('hunter_report', 'Нет данных')}\n")
+                print(f"[АДВОКАТ / SKEPTIC]:\n{final_state.get('skeptic_report', 'Нет данных')}")
+                print("-"*70 + "\n")
             
         except KeyboardInterrupt:
             print("\n[SYSTEM] Shutdown requested by user.")
