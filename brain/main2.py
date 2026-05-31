@@ -46,12 +46,10 @@ class IcedentAgentState(TypedDict):
     skeptic_report: str  
 
 llm = ChatOllama(
-    model="qwen3.5:9b", 
+    model="qwen3.5:4b",
     validate_model_on_init=True,
     temperature=0,
-    num_ctx=8192 
 )
-
 # ==========================================
 # NEO4J TOOL (SPATIAL CONTEXT)
 # ==========================================
@@ -106,6 +104,7 @@ def check_trigger(ip: str, level: int) -> bool:
         return True
     return False
 
+
 def extrtacting(state: IcedentAgentState):
     try:
         r_client.ping()
@@ -115,11 +114,9 @@ def extrtacting(state: IcedentAgentState):
 
     print("\n[SYSTEM] Waiting for alerts...")
     
-    # Wait for the first log (Blocking)
     queue_name, first_log_string = r_client.brpop(ALERTS_QUEUE)
     raw_logs = [first_log_string]
     
-    # BATCHING: Instantly pull all accumulated logs
     while True:
         extra_log = r_client.lpop(ALERTS_QUEUE)
         if extra_log:
@@ -148,14 +145,27 @@ def extrtacting(state: IcedentAgentState):
             r_client.zadd(history_key, {json.dumps(log_data): current_time})
             r_client.zremrangebyscore(history_key, 0, current_time - HISTORY_WINDOW_SEC)
 
-        dedup_key = f"dedup:{raw_id}:{raw_ip}"
-        is_new_alert = r_client.set(name=dedup_key, value="1", ex=1000, nx=True)
-
-        if is_new_alert:
-            unique_alerts.append(log_data)
+            # ИСПРАВЛЕНИЕ: Проверяем триггер ДО дедупликации!
+            # Считаем КАЖДЫЙ лог, чтобы сработал порог (ALERT_THRESHOLD)
             if check_trigger(raw_ip, level):
                 needs_escalation = True
                 escalated_ip = raw_ip
+
+        # Дедупликация на 1000 секунд
+        dedup_key = f"dedup:{raw_id}:{raw_ip}"
+        is_new_alert = r_client.set(name=dedup_key, value="1", ex=300, nx=True)
+
+        if is_new_alert:
+            unique_alerts.append(log_data)
+
+    if needs_escalation:
+        print(f"[EXTRACT] Incident escalated for IP {escalated_ip}. Bypassing L1.")
+        return {
+            "incedent": [], 
+            "messages": [], 
+            "escalate": True,
+            "target_ip": escalated_ip
+        }
 
     if not unique_alerts:
         print("[EXTRACT] All alerts in batch were duplicates. Dropping.")
@@ -163,7 +173,6 @@ def extrtacting(state: IcedentAgentState):
 
     print(f"[EXTRACT] Filtered down to {len(unique_alerts)} UNIQUE alerts.")
 
-    # Prepare prompt for L1
     batch_prompt = "Analyze this batch of alerts and provide a single summary:\n\n"
     for idx, alert in enumerate(unique_alerts):
         desc = alert.get("rule", {}).get("description", "No description")
@@ -174,10 +183,9 @@ def extrtacting(state: IcedentAgentState):
     return {
         "incedent": [], 
         "messages": [HumanMessage(content=batch_prompt)],
-        "escalate": needs_escalation,
+        "escalate": False,
         "target_ip": escalated_ip
     }
-
 # ==========================================
 # STAGE 2: L1 (QUICK TRIAGE)
 # ==========================================
@@ -189,19 +197,32 @@ def analising(state: IcedentAgentState):
     print("[L1] Performing quick noise filtration (Compute ROI check)...")
     base_prompt = (
         "You are an L1 SOC AI Analyst. Your goal is to triage an alert provided in STIX format.\n"
-        "RULE 1: Your final response MUST STRICTLY follow the Markdown format below, without unnecessary introductions:\n\n"
-        "Verdict: [Specify: True Positive (Actual threat) or False Positive (False alarm)]\n"
-        "Confidence Level: [Specify in percentage, e.g., 95%]\n"
-        "Incident Summary: [Describe the nature of the attack in 2-3 sentences in plain language, using data from the alert]\n"
-        "MITRE ATT&CK Matrix: [Specify tactic and technique, e.g., Initial Access -> Privilege Escalation]\n"
-        "Containment Recommendation: [Specify concrete actions, e.g., 'Isolate host VM1', 'Block IP', or 'Close as background noise']"
+        "INSTRUCTIONS:\n"
+        "1. Analyze the alert objectively.\n"
+        "2. Your response MUST STRICTLY follow the Markdown format below without any introductory or conversational text.\n\n"
+        "**Verdict:** [Specify: True Positive or False Positive]\n"
+        "**Confidence Level:** [Specify in percentage, e.g., 90%]\n"
+        "**Incident Summary:** [Write a concise paragraph of 2-3 sentences detailing what happened, the systems involved, and the potential impact.]\n"
+        "**MITRE ATT&CK Matrix:** [Specify Tactic and Technique, e.g., Initial Access (T1190)]\n"
+        "**Containment Recommendation:** [Provide 1-2 specific actions, e.g., 'Isolate IP 192.168.1.5' or 'Close as benign noise']"
     )
 
     sys_message = SystemMessage(content=base_prompt)
     start_time = time.time()
+
+    start_time = time.time()
+
     response = llm.invoke([sys_message] + state["messages"])
+
+    end_time = time.time()
+    thinking_time = end_time - start_time
+
+    print("\n" + "-" * 60)
+    print(f"  [L1-ANALYST] AI thinking for the: {thinking_time:.2f} sec.".center(60))
+    print("  └── [L1-ANALYST] Answer:")
+    print(response.content)
+    print("-" * 60 + "\n")
     
-    print(f"[L1] Report generated in {(time.time()-start_time):.2f} sec.")
     return {"report": response.content}
 
 # ==========================================
@@ -322,50 +343,72 @@ def hunter_agent(state: IcedentAgentState):
     print("  ├── [L2-HUNTER] Prosecuting the incident (Building attack vector)...")
     hunter_prompt = (
         "You are an L2 SOC Threat Hunter. Your goal is to prove this STIX bundle represents a real cyber attack.\n"
-        "Carefully read the occurrence counts and relationships in the STIX bundle.\n\n"
         "INSTRUCTIONS:\n"
-        "1. Write your detailed internal thinking process in ENGLISH to ensure maximum logical accuracy.\n"
-        "2. Provide a comprehensive formal report in RUSSIAN.\n"
-        "3. Do not limit your facts. Include ALL relevant evidence, IPs, and attack patterns.\n\n"
-        "Format EXACTLY like this:\n\n"
-        "THINKING PROCESS:\n"
-        "[Your detailed step-by-step analysis in English. Analyze the IPs, frequency of events, and Kill Chain]\n\n"
-        "HUNTER REPORT:\n"
-        "Atack vector: [A detailed description of exactly how the attacker operates]\n"
-        "Evidence:\n"
-        "- [Fact 1: A description that includes specific figures and IP addresses]\n"
-        "- [Fact 2: ... list all the anomalies found]\n"
-        "Conclusion: [Final Conclusion]"
+        "1. Analyze the Kill Chain, focusing on how the attacker moved through the system (Initial Access, Execution, Privilege Escalation, Exfiltration).\n"
+        "2. Be analytical and professional. Avoid redundant phrasing.\n"
+        "3. Output EXACTLY in the format below.\n\n"
+        "**ANALYSIS:**\n"
+        "[Write a logical paragraph of 3-4 sentences explaining the sequence of events. Describe how the specific IPs, files, and relationships in the STIX data demonstrate an attack path.]\n\n"
+        "**HUNTER REPORT:**\n"
+        "* **Attack Vector:** [1-2 sentences summarizing the core attack method]\n"
+        "* **Critical Evidence:**\n"
+        "  - [Key Fact 1: Mention specific IP, Rule Level, or Compromised File]\n"
+        "  - [Key Fact 2: Mention lateral movement or frequency of anomalies]\n"
+        "  - [Key Fact 3: Mention data exfiltration or persistence attempts]\n"
+        "* **Conclusion:** [A definitive statement confirming the system is compromised]"
     )
     sys_message = SystemMessage(content=hunter_prompt)
     stix_msg = HumanMessage(content=f"STIX BUNDLE:\n{state.get('stix_bundle', '')}")
     
+    start_time = time.time()
+
     response = llm.invoke([sys_message, stix_msg])
+
+    end_time = time.time()
+    thinking_time = end_time - start_time
+
+    print("\n" + "-" * 60)
+    print(f"   [L2-Hunter] AI thinking for the: {thinking_time:.2f} sec.".center(60))
+    print("  └── [L2-HUNTER] Answer:")
+    print(response.content)
+    print("-" * 60 + "\n")
+
     return {"hunter_report": response.content}
 
 def skeptic_agent(state: IcedentAgentState):
     print("  └── [L2-SKEPTIC] Defending the incident (Searching for False Positives)...")
     skeptic_prompt = (
-        "You are an L2 SOC Validation Analyst. Your goal is to prove this STIX bundle is a False Positive, benign activity, or system glitch.\n"
-        "Carefully read the occurrence counts and relationships in the STIX bundle.\n\n"
+        "You are an L2 SOC Validation Analyst. Your goal is to critically examine the STIX bundle and argue why it might be a False Positive, benign administrative activity, or a system glitch.\n"
         "INSTRUCTIONS:\n"
-        "1. Write your detailed internal thinking process in ENGLISH to ensure maximum logical accuracy.\n"
-        "2. Provide a comprehensive formal report in RUSSIAN.\n"
-        "3. Do not limit your arguments. Include ALL possible benign explanations for the observed behavior.\n\n"
-        "Format EXACTLY like this:\n\n"
-        "THINKING PROCESS:\n"
-        "[Your detailed step-by-step analysis in English. Look for misconfigurations, internal IPs, or normal system behaviors]\n\n"
-        "SKEPTIC REPORT:\n"
-        "Reasonable explanation: [A detailed explanation of why this might be the norm]\n"
-        "Mitigating factors:\n"
-        "- [Argument 1: The nature of the network, the absence of data theft, etc.]\n"
-        "- [Argument 2: ... list all the excuses]\n"
-        "Conclusion: [Final conclusion]"
+        "1. Look for signs of internal environments (RFC 1918 IPs), routine backups, automated patching (CVE updates), or common misconfigurations.\n"
+        "2. Be objective. Do not invent facts, only use the provided STIX data.\n"
+        "3. Output EXACTLY in the format below.\n\n"
+        "**ANALYSIS:**\n"
+        "[Write a logical paragraph of 3-4 sentences explaining the benign context. Explain why the sequence of events could represent normal system behavior or a DevOps process rather than an attack.]\n\n"
+        "**SKEPTIC REPORT:**\n"
+        "* **Reasonable Explanation:** [1-2 sentences summarizing the benign scenario]\n"
+        "* **Mitigating Factors:**\n"
+        "  - [Mitigating Fact 1: e.g., Traffic is strictly internal, no external C2]\n"
+        "  - [Mitigating Fact 2: e.g., The involved files are standard configuration backups]\n"
+        "  - [Mitigating Fact 3: e.g., High-frequency alerts correspond to known automated processes]\n"
+        "* **Conclusion:** [A definitive statement classifying the events as benign or false positive]"
     )
     sys_message = SystemMessage(content=skeptic_prompt)
     stix_msg = HumanMessage(content=f"STIX BUNDLE:\n{state.get('stix_bundle', '')}")
     
+    start_time = time.time()
+
     response = llm.invoke([sys_message, stix_msg])
+
+    end_time = time.time()
+    thinking_time = end_time - start_time
+
+    print("\n" + "-" * 60)
+    print(f"  [L2-Hunter] AI thinking for the: {thinking_time:.2f} sec.".center(60))
+    print("  └── [L2-SKEPTIC] Answer:")
+    print(response.content)
+    print("-" * 60 + "\n")
+
     return {"skeptic_report": response.content}
 # ==========================================
 # STAGE 5: JUDGE (GRAPHRAG RESOLUTION)
@@ -412,22 +455,24 @@ def judge_agent(state: IcedentAgentState):
     
         # Clean final prompt enforcing Russian language
         final_prompt = (
-                "Review the Neo4j context and the agent reports. "
-                "Write the FINAL report strictly in RUSSIAN language.\n\n"
-                "Format:\n"
-                "Verdict: [True Positive / False Positive]\n"
-                "Confidence: [Enter a percentage, e.g., 95%]\n"
-                "MITRE ATT&CK: [Describe the tactics and techniques, for example Initial Access - Brute Force]\n"
-                "Infrastructure Context: [few sentence based on Neo4j]!!!If you have an ACCESS if not wtrite you do not have access!!!\n"
-                "Justification: [Whose arguments prevailed, and why?]\n"
-                "Action: [Specific recommendation]"
-            )
+            "Review the Neo4j context and the agent reports. "
+            "You MUST output your response EXACTLY in the format below. "
+            "CRITICAL RULES: Do NOT add any preamble or conclusion. Do NOT add markdown headers like '# EXECUTIVE SUMMARY' or tables. "
+            "STRICTLY use these exact keys:\n\n"
+            "Verdict: [Specify True Positive or False Positive]\n"
+            "Confidence: [Enter a percentage, e.g., 95%]\n"
+            "MITRE ATT&CK: [Describe the tactics and techniques, e.g., Initial Access - Brute Force]\n"
+            "Infrastructure Context: [Provide 1-2 sentences based on Neo4j. If you do not have access, write 'Topology data is unavailable']\n"
+            "Justification: [Explain whose arguments prevailed, and why?]\n"
+            "Action: [Provide specific containment recommendation]"
+        )
         
         messages_to_pass.append(HumanMessage(content=final_prompt))
         
         start_time = time.time()
         # Normal LLM invoke (no tools bound) forces text generation
         response = llm.invoke(messages_to_pass) 
+
         print(f"[L3-JUDGE] Verdict reached in {(time.time()-start_time):.2f} sec.")
         return {"messages": [response]}
 
@@ -483,6 +528,7 @@ if __name__ == "__main__":
     print("SOC AI V2: BATCHING + GRAPHRAG (THESIS ARCHITECTURE)")
     print("=" * 60)
 
+
     while True:
         try:
             # Re-initialize all fields to prevent key errors
@@ -504,17 +550,15 @@ if __name__ == "__main__":
                 print("="*70)
                 print(final_state["messages"][-1].content)
                 print("="*70)
-                
-                # Добавляем информативности: показываем скрытую работу агентов
-                print("\n" + "-"*70)
-                print("--- ИНВЕСТИГАЦИОННОЕ ДОСЬЕ (МАТЕРИАЛЫ АГЕНТОВ) ---".center(70))
-                print("-"*70)
-                print(f"[ПРОКУРОР / HUNTER]:\n{final_state.get('hunter_report', 'Нет данных')}\n")
-                print(f"[АДВОКАТ / SKEPTIC]:\n{final_state.get('skeptic_report', 'Нет данных')}")
-                print("-"*70 + "\n")
             
         except KeyboardInterrupt:
             print("\n[SYSTEM] Shutdown requested by user.")
+            print("[SYSTEM] Flushing Redis database to clear deduplication keys and archives...")
+            try:
+                r_client.flushdb()
+                print("[SYSTEM] Cleanup successful. Goodbye!")
+            except Exception as e:
+                print(f"[ERROR] Cleanup failed: {e}")
             break
         except Exception as e:
             print(f"\n[CRITICAL ERROR] {e}")
