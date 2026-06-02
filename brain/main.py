@@ -46,41 +46,61 @@ class IncidentAgentState(TypedDict):
     skeptic_report: str  
 
 llm = ChatOllama(
-    model="qwen3.5:4b",
+    model="llama3.1:8b",
     validate_model_on_init=True,
     temperature=0,
 )
 # ==========================================
 # NEO4J TOOL (SPATIAL CONTEXT)
 # ==========================================
-@tool
-def check_network_topology(ip_address: str) -> str:
+
+def check_network_topology(ip_addresses_str: str) -> str:
     """
-    Returns network topology information for a given IP address.
-    Always use this tool to determine the blast radius and asset criticality.
+    Returns network topology information for multiple IP addresses.
     """
+    # Разбиваем входящую строку на чистые IP-адреса
+    ips_to_check = [ip.strip(' "\'\n') for ip in ip_addresses_str.split(",") if ip.strip(' "\'\n')]
+    
+    print("\n" + "-" * 60)
+    print(f"[L3-JUDGE -> NEO4J] AI requested topology for IPs: {ips_to_check}")
+    
     URI = "bolt://localhost:7687"
-    AUTH = ("neo4j", "password")
+    AUTH = ("neo4j", "password") # Убедись, что пароль твой
+    
+    combined_results = []
+    
     try:
         with GraphDatabase.driver(URI, auth=AUTH) as driver:
-            with driver.session() as session:
+            with driver.session(database="neo4j") as session:
                 query = """
                 MATCH (s:Server {ip: $ip})
                 OPTIONAL MATCH (srv:Service)-[:RUNS_ON]->(s)
                 OPTIONAL MATCH (s)-[:BELONGS_TO]->(z:Zone)
                 RETURN s.name AS Server, z.name AS Zone, collect(srv.name) AS Services
                 """
-                result = session.run(query, ip=ip_address)
-                data = result.single()
                 
-                if data and data["Server"]:
-                    return f"Server: {data['Server']}, Zone: {data['Zone']}, Services running: {', '.join(data['Services'])}"
-                else:
-                    return f"No topology data found for IP: {ip_address}."
+                # Делаем запрос в базу для каждого IP
+                for clean_ip in ips_to_check:
+                    result = session.run(query, ip=clean_ip)
+                    data = result.single()
+                    
+                    if data and data["Server"]:
+                        result_str = f"IP {clean_ip} -> Server: {data['Server']}, Zone: {data['Zone']}, Services: {', '.join(data['Services'])}"
+                        combined_results.append(result_str)
+                    else:
+                        combined_results.append(f"IP {clean_ip} -> No topology data found.")
+                        
     except Exception as e:
-        return f"Neo4j Error: {str(e)}"
+        error_msg = f"Neo4j Error: {str(e)}"
+        print(f"[NEO4J] CRITICAL ERROR: {error_msg}")
+        return error_msg
 
-tools = [check_network_topology]
+    final_output = "\n".join(combined_results)
+    print(f"[NEO4J] Returning combined data:\n{final_output}")
+    print("-" * 60)
+    
+    return final_output
+
 
 # ==========================================
 # STAGE 1: EXTRACT, BATCH AND TRIGGER
@@ -112,32 +132,43 @@ def extrtacting(state: IncidentAgentState):
         print("[ERROR] Redis connection failed!")
         return {"incedent": [], "messages": [], "escalate": False, "target_ip": ""}
 
-    print("\n[SYSTEM] Waiting for alerts...")
+    print("\n[SYSTEM] Extracting all available alerts from queue...")
     
-    queue_name, first_log_string = r_client.brpop(ALERTS_QUEUE)
-    raw_logs = [first_log_string]
-    
+    start_time = time.time()
+
+    raw_logs = []
     while True:
-        extra_log = r_client.lpop(ALERTS_QUEUE)
-        if extra_log:
-            raw_logs.append(extra_log)
+        item = r_client.brpop(ALERTS_QUEUE, timeout=3)
+        if item:
+            raw_logs.append(item[1])
         else:
             break
             
-    print(f"[EXTRACT] Pulled a batch of {len(raw_logs)} alerts from queue.")
+    if not raw_logs:
+        print("[EXTRACT] Queue is empty. No alerts to process.")
+        return {"incedent": [], "messages": [], "escalate": False, "target_ip": "UNKNOWN_IP"}
+        
+    end_time = time.time()
+    duration_time = end_time - start_time
+
+    print(f"[EXTRACT] Pulled a batch of {len(raw_logs)} alerts from queue in {duration_time} s.")
 
     unique_alerts = []
     needs_escalation = False
-    escalated_ip = "UNKNOWN_IP"
+    escalated_ips = set() # СОБИРАЕМ ВСЕ АТАКОВАННЫЕ IP В СПИСОК
 
-    # Deduplicate and build time machine archive
     for log_str in raw_logs:
         sample_log = json.loads(log_str)
         log_data = json.loads(sample_log) if isinstance(sample_log, str) else sample_log
 
         raw_id = log_data.get("rule", {}).get("id", "UNKNOWN_RULE")
         level = int(log_data.get("rule", {}).get("level", 0))
+        
+        # 1. IP Агента Wazuh (VM1 или VM2)
         raw_ip = log_data.get("agent", {}).get("ip", "UNKNOWN_IP")
+        
+        # 2. IP Атакующего (Извлекаем Source IP из логов)
+        src_ip = log_data.get("data", {}).get("srcip")
         
         if raw_ip != "UNKNOWN_IP":
             history_key = f"logs_archive:{raw_ip}"
@@ -145,37 +176,34 @@ def extrtacting(state: IncidentAgentState):
             r_client.zadd(history_key, {json.dumps(log_data): current_time})
             r_client.zremrangebyscore(history_key, 0, current_time - HISTORY_WINDOW_SEC)
 
-            # ИСПРАВЛЕНИЕ: Проверяем триггер ДО дедупликации!
-            # Считаем КАЖДЫЙ лог, чтобы сработал порог (ALERT_THRESHOLD)
+            # Если сработал триггер - добавляем IP в копилку
             if check_trigger(raw_ip, level):
                 needs_escalation = True
-                escalated_ip = raw_ip
+                # Добавляем сервер-жертву
+                escalated_ips.add(raw_ip)
+                
+                # КРИТИЧЕСКИЙ ФИКС: Добавляем IP хакера (если он есть) в запрос для Neo4j
+                if src_ip and src_ip not in ["127.0.0.1", "0.0.0.0", "localhost", "::1"]:
+                    escalated_ips.add(src_ip)
 
-        # Дедупликация на 1000 секунд
         dedup_key = f"dedup:{raw_id}:{raw_ip}"
         is_new_alert = r_client.set(name=dedup_key, value="1", ex=300, nx=True)
 
         if is_new_alert:
             unique_alerts.append(log_data)
 
-    if not unique_alerts:
-        print("[EXTRACT] All alerts in batch were duplicates. Dropping.")
-        return {"incedent": [], "messages": [], "escalate": False, "target_ip": ""}
-
-    print(f"[EXTRACT] Filtered down to {len(unique_alerts)} UNIQUE alerts.")
-
-    # Определяем IP-адрес для передачи следующему агенту
-    final_ip = escalated_ip if needs_escalation else unique_alerts[0].get("agent", {}).get("ip", "UNKNOWN_IP")
-
+    # Склеиваем все IP через запятую
     if needs_escalation:
-        print(f"[EXTRACT] Incident escalated for IP {final_ip}. Script threshold reached.")
+        final_ip_str = ", ".join(list(escalated_ips))
+        print(f"[EXTRACT] COMPLEX INCIDENT ESCALATED FOR IPs: {final_ip_str}")
+    else:
+        final_ip_str = unique_alerts[0].get("agent", {}).get("ip", "UNKNOWN_IP") if unique_alerts else "UNKNOWN_IP"
 
-    # Возвращаем простое системное сообщение для роутера и правильный IP
     return {
         "incedent": [], 
-        "messages": [HumanMessage(content="Logs collected and ready for STIX conversion.")],
+        "messages": [HumanMessage(content="Logs collected.")],
         "escalate": needs_escalation,
-        "target_ip": final_ip
+        "target_ip": final_ip_str
     }
 
 
@@ -185,12 +213,11 @@ def extrtacting(state: IncidentAgentState):
 def summarize_stix_bundle(bundle_objects):
     """
     Преобразует массив объектов STIX в сжатый формат.
-    Использует двухпроходный алгоритм для сохранения реальных сущностей (IP, Users) 
-    с одновременной группировкой повторяющихся событий (Wazuh Rules).
+    Идеально группирует события, отсекая лишний шум (уникальные таймстемпы).
     """
     event_counter = {}
     rel_counter = {}
-    entities = set() # Множество для уникальных участников инцидента
+    entities = set() 
 
     # ШАГ 1: Построение словаря для расшифровки UUID в реальные значения
     id_resolver = {}
@@ -199,7 +226,6 @@ def summarize_stix_bundle(bundle_objects):
         obj_type = obj_dict.get("type", "unknown")
         obj_id = obj_dict.get("id", "unknown")
         
-        # Извлекаем реальные данные в зависимости от типа STIX-объекта
         if obj_type == "ipv4-addr":
             ip_val = obj_dict.get("value", "Unknown IP")
             id_resolver[obj_id] = ip_val
@@ -227,7 +253,25 @@ def summarize_stix_bundle(bundle_objects):
         if obj_type == "observed-data":
             rule_desc = obj_dict.get("x_wazuh_rule_desc", "Unknown Rule")
             level = obj_dict.get("x_wazuh_rule_level", 0)
-            event_key = f"[EVENT] Lvl: {level} | Desc: {rule_desc}"
+            
+            context_parts = []
+            
+            # Достаем ТОЛЬКО самое важное "мясо" (без сырых логов)
+            syscheck_path = obj_dict.get("x_wazuh_syscheck_path", "")
+            if syscheck_path:
+                context_parts.append(f"File: {syscheck_path}")
+                
+            wazuh_data = obj_dict.get("x_wazuh_data", "")
+            if wazuh_data:
+                context_parts.append(f"Data: {wazuh_data}")
+
+            context_snippet = " | ".join(context_parts)
+            
+            if context_snippet:
+                event_key = f"[EVENT] Lvl: {level} | Desc: {rule_desc} | Context: {context_snippet}"
+            else:
+                event_key = f"[EVENT] Lvl: {level} | Desc: {rule_desc}"
+                
             event_counter[event_key] = event_counter.get(event_key, 0) + 1
             
         elif obj_type == "relationship":
@@ -235,14 +279,13 @@ def summarize_stix_bundle(bundle_objects):
             source_id = obj_dict.get("source_ref", "")
             target_id = obj_dict.get("target_ref", "")
             
-            # Подставляем реальное значение. Если его нет в словаре - берем базовый тип
             source_name = id_resolver.get(source_id, source_id.split("--")[0])
             target_name = id_resolver.get(target_id, target_id.split("--")[0])
             
             rel_key = f"[RELATIONSHIP] {source_name} -> {rel_type} -> {target_name}"
             rel_counter[rel_key] = rel_counter.get(rel_key, 0) + 1
 
-    # ШАГ 3: Формирование финального высокоплотного контекста для LLM
+    # ШАГ 3: Формирование финального высокоплотного контекста
     summary_lines = ["--- INVOLVED ENTITIES (THE 'WHO' & 'WHERE') ---"]
     summary_lines.extend(list(entities))
     
@@ -254,40 +297,62 @@ def summarize_stix_bundle(bundle_objects):
     for rel_str, count in rel_counter.items():
         summary_lines.append(f"{rel_str} (x{count})" if count > 1 else rel_str)
             
-    return "\n".join(summary_lines) if len(summary_lines) > 3 else "No meaningful STIX objects extracted."
+    final_stix_text = "\n".join(summary_lines) if len(summary_lines) > 3 else "No meaningful STIX objects extracted."
+    
+    # Жесткий лимит для защиты памяти Mac
+    if len(final_stix_text) > 3500:
+        final_stix_text = final_stix_text[:3500] + "\n... [TRUNCATED DUE TO SYSTEM CONSTRAINTS]"
+    
+    print("#"*50)
+    print("#"*50)
+    print(final_stix_text)
+    print("#"*50)
+    print("#"*50)
+
+    return final_stix_text
 
 def context_aggregator(state: IncidentAgentState):
-    print("\n[L2-AGGREGATOR] Building 15-minute historical context...")
-    target_ip = state.get("target_ip")
+    target_ips_str = state.get("target_ip", "")
+    print(f"\n[L2-AGGREGATOR] Building historical context for involved hosts: [{target_ips_str}]...")
     
-    history_key = f"logs_archive:{target_ip}"
-    raw_logs = r_client.zrange(history_key, 0, -1)
-    
+    ip_list = [ip.strip() for ip in target_ips_str.split(",") if ip.strip()]
     master_objects = []
-    for raw_log_str in raw_logs:
-        try:
-            log_dict = json.loads(raw_log_str)
-            bundle = convert_wazuh_to_stix(log_dict)
-            master_objects.extend(bundle.objects)
-        except Exception:
-            continue
+    
+    for ip in ip_list:
+        history_key = f"logs_archive:{ip}"
+        raw_logs = r_client.zrange(history_key, 0, -1)
+        
+        for raw_log_str in raw_logs:
+            try:
+                log_dict = json.loads(raw_log_str)
+                bundle = convert_wazuh_to_stix(log_dict)
+                master_objects.extend(bundle.objects)
+            except Exception:
+                continue
             
     seen_ids = set()
     unique_objects = []
+    all_discovered_ips = set(ip_list) # Сохраняем изначально переданные IP
+
     for obj in master_objects:
         obj_id = obj.get("id")
         if obj_id not in seen_ids:
             seen_ids.add(obj_id)
             unique_objects.append(obj)
+            
+        # КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: Собираем абсолютно все IP-адреса, засветившиеся в STIX
+        if obj.get("type") == "ipv4-addr":
+            ip_value = obj.get("value")
+            if ip_value and ip_value not in ["127.0.0.1", "0.0.0.0", "localhost", "::1"]:
+                all_discovered_ips.add(ip_value)
     
     compressed_stix = summarize_stix_bundle(unique_objects)
     
-    print(f"[L2-AGGREGATOR] Compressed STIX bundle created ({len(compressed_stix)} chars).")
-    print("[L2-AGGREGATOR] --- COMPRESSED CONTEXT PREVIEW ---")
-    print(compressed_stix)
-    print("[L2-AGGREGATOR] ------------------------------------")
+    # Обновляем target_ip, теперь в нем 100% будут все вовлеченные адреса
+    final_ips_str = ", ".join(list(all_discovered_ips))
     
-    return {"stix_bundle": compressed_stix}
+    print(f"[L2-AGGREGATOR] Multi-Host STIX bundle created ({len(compressed_stix)} chars).")
+    return {"stix_bundle": compressed_stix, "target_ip": final_ips_str}
 
 # ==========================================
 # STAGE 4: AGENTS (HUNTER & SKEPTIC)
@@ -302,14 +367,15 @@ def hunter_agent(state: IncidentAgentState):
         "2. Be analytical and professional. Avoid redundant phrasing.\n"
         "3. Output EXACTLY in the format below.\n\n"
         "**ANALYSIS:**\n"
-        "[Write a logical paragraph of 3-4 sentences explaining the sequence of events. Describe how the specific IPs, files, and relationships in the STIX data demonstrate an attack path.]\n\n"
+        "[Write a logical paragraph of 3-6 sentences explaining the sequence of events. Describe how the specific IPs, files, and relationships in the STIX data demonstrate an attack path.]\n\n"
         "**HUNTER REPORT:**\n"
-        "* **Attack Vector:** [1-2 sentences summarizing the core attack method]\n"
+        "* **Attack Vector:** [1-4 sentences summarizing the core attack method]\n"
         "* **Critical Evidence:**\n"
         "  - [Key Fact 1: Mention specific IP, Rule Level, or Compromised File]\n"
         "  - [Key Fact 2: Mention lateral movement or frequency of anomalies]\n"
         "  - [Key Fact 3: Mention data exfiltration or persistence attempts]\n"
         "* **Conclusion:** [A definitive statement confirming the system is compromised]"
+        "Do not generate any extra text after the Conclusion."
     )
     sys_message = SystemMessage(content=hunter_prompt)
     stix_msg = HumanMessage(content=f"STIX BUNDLE:\n{state.get('stix_bundle', '')}")
@@ -332,20 +398,20 @@ def hunter_agent(state: IncidentAgentState):
 def skeptic_agent(state: IncidentAgentState):
     print("  └── [L2-SKEPTIC] Defending the incident (Searching for False Positives)...")
     skeptic_prompt = (
-        "You are an L2 SOC Validation Analyst. Your goal is to critically examine the STIX bundle and argue why it might be a False Positive, benign administrative activity, or a system glitch.\n"
-        "INSTRUCTIONS:\n"
-        "1. Look for signs of internal environments (RFC 1918 IPs), routine backups, automated patching (CVE updates), or common misconfigurations.\n"
-        "2. Be objective. Do not invent facts, only use the provided STIX data.\n"
-        "3. Output EXACTLY in the format below.\n\n"
+        "You are an L2 SOC Validation Analyst. Your goal is to critically examine the STIX bundle and look for benign explanations (False Positives, admin activity, cron jobs).\n"
+        "CRITICAL INSTRUCTIONS:\n"
+        "1. Identify the Source: Where are the actions originating from? Are they internal (RFC 1918 IPs like 172.16.x.x) or external?\n"
+        "2. Evaluate File Activity: Are the files related to 'audit', 'report', 'backup', 'status', or 'docker'? If so, they MIGHT be benign automated scripts, BUT ONLY IF they stay within internal zones.\n"
+        "3. The Exfiltration Test: If there is evidence of data (like 'dump.csv' or '.bak') being moved to an External/Unknown IP, or accessed via unauthorized FTP/SSH, you CANNOT claim it is benign. You MUST acknowledge the threat (True Positive).\n"
+        "4. Output EXACTLY in the format below:\n\n"
         "**ANALYSIS:**\n"
-        "[Write a logical paragraph of 3-4 sentences explaining the benign context. Explain why the sequence of events could represent normal system behavior or a DevOps process rather than an attack.]\n\n"
+        "[Write 3-6 sentences. 1. Identify if the IPs are internal or external. 2. Explain if the file names suggest benign activity. 3. Assess if there is any indication of exfiltration or unauthorized access.]\n\n"
         "**SKEPTIC REPORT:**\n"
-        "* **Reasonable Explanation:** [1-2 sentences summarizing the benign scenario]\n"
+        "* **Reasonable Explanation:** [Summarize the benign scenario, or state 'No benign explanation found due to external access/exfiltration']\n"
         "* **Mitigating Factors:**\n"
-        "  - [Mitigating Fact 1: e.g., Traffic is strictly internal, no external C2]\n"
-        "  - [Mitigating Fact 2: e.g., The involved files are standard configuration backups]\n"
-        "  - [Mitigating Fact 3: e.g., High-frequency alerts correspond to known automated processes]\n"
-        "* **Conclusion:** [A definitive statement classifying the events as benign or false positive]"
+        "  - [Fact 1: e.g., All IPs are internal]\n"
+        "  - [Fact 2: e.g., File names indicate routine backups]\n"
+        "* **Conclusion:** [State clearly if you think it is a False Positive or a True Positive]"
     )
     sys_message = SystemMessage(content=skeptic_prompt)
     stix_msg = HumanMessage(content=f"STIX BUNDLE:\n{state.get('stix_bundle', '')}")
@@ -358,7 +424,7 @@ def skeptic_agent(state: IncidentAgentState):
     thinking_time = end_time - start_time
 
     print("\n" + "-" * 60)
-    print(f"  [L2-Hunter] AI thinking for the: {thinking_time:.2f} sec.".center(60))
+    print(f"  [L2-SCEPTIC] AI thinking for the: {thinking_time:.2f} sec.".center(60))
     print("  └── [L2-SKEPTIC] Answer:")
     print(response.content)
     print("-" * 60 + "\n")
@@ -367,89 +433,114 @@ def skeptic_agent(state: IncidentAgentState):
 # ==========================================
 # STAGE 5: JUDGE (GRAPHRAG RESOLUTION)
 # ==========================================
+# ==========================================
+# STAGE 5: JUDGE (ONE-PASS RESOLUTION)
+# ==========================================
 def judge_agent(state: IncidentAgentState):
     target_ip = state.get("target_ip")
     
-    # Ensure tool interaction history is kept clean
-    judge_history = []
-    has_tool_message = False
-    for msg in state["messages"]:
-        if isinstance(msg, ToolMessage):
-            judge_history.append(msg)
-            has_tool_message = True
-        elif isinstance(msg, AIMessage) and hasattr(msg, "tool_calls") and msg.tool_calls:
-            judge_history.append(msg)
+    print(f"\n[L3-JUDGE] Requesting Neo4j context for IP {target_ip}...")
+    
+    # 1. УДОБНЫЙ ПЕРЕКЛЮЧАТЕЛЬ USE_NEO4J (Прямой вызов Python функции)
+    if USE_NEO4J:
+        try:
+            neo4j_result = check_network_topology(target_ip)
+        except Exception as e:
+            neo4j_result = f"Neo4j Python Error: {e}"
+    else:
+        print("[L3-JUDGE] Neo4j is DISABLED. Skipping graph query.")
+        neo4j_result = "Neo4j is DISABLED. Topology data is unavailable."
+        
+    print("[L3-JUDGE] Context gathered. Generating final verdict...")
 
-    # Initial instruction payload for the Judge
-    context_prompt = f"""You are the Lead Incident Responder.
-    Target IP: {target_ip}
+    # 2. ИЗОЛИРОВАННЫЙ КОНТЕКСТ В XML (Защита от загрязнения)
+    context_prompt = f"""You are the Lead Incident Responder. Read the data below.
 
-    --- STIX BUNDLE ---
+    <target_ip>
+    {target_ip}
+    </target_ip>
+
+    <neo4j_topology_context>
+    {neo4j_result}
+    </neo4j_topology_context>
+
+    <stix_bundle_data>
     {state.get('stix_bundle', '')}
+    </stix_bundle_data>
 
-    --- HUNTER REPORT ---
+    <sub_agents_reports>
+    HUNTER AGENT:
     {state.get('hunter_report', '')}
 
-    --- SKEPTIC REPORT ---
+    SKEPTIC AGENT:
     {state.get('skeptic_report', '')}
+    </sub_agents_reports>
     """
-    messages_to_pass = [SystemMessage(content=context_prompt)] + judge_history
-
-    if not has_tool_message and USE_NEO4J:
-        print(f"[L3-JUDGE] Requesting Neo4j context for IP {target_ip}...")
-        # FORCE the LLM to call the tool to guarantee spatial context extraction
-        llm_forced = llm.bind_tools(tools, tool_choice="check_network_topology")
-        response = llm_forced.invoke(messages_to_pass)
-        return {"messages": [response]}
-    else:
-        if not USE_NEO4J:
-            print("[L3-JUDGE] Neo4j is DISABLED. Generating verdict without graph context...")
-        else:
-            print("[L3-JUDGE] Neo4j data received. Generating final verdict...")
     
-    
-        final_prompt = (
-            "Review the Neo4j context and the agent reports. "
-            "You MUST output your response EXACTLY in the format below. "
-            "CRITICAL RULES: Do NOT add any preamble or conclusion. Do NOT add markdown headers like '# EXECUTIVE SUMMARY' or tables. "
-            "STRICTLY use these exact keys:\n\n"
-            "Verdict: [Specify True Positive or False Positive]\n"
-            "Confidence: [Enter a percentage, e.g., 95%]\n"
-            "MITRE ATT&CK: [Describe the tactics and techniques, e.g., Initial Access - Brute Force]\n"
-            "Infrastructure Context: [Provide 1-2 sentences based on Neo4j. If you do not have access, write 'Topology data is unavailable']\n"
-            "Justification: [Explain whose arguments prevailed, and why?]\n"
-            "Action: [Provide specific containment recommendation]"
-        )
-        
-        messages_to_pass.append(HumanMessage(content=final_prompt))
-        
-        start_time = time.time()
-        # Normal LLM invoke (no tools bound) forces text generation
-        response = llm.invoke(messages_to_pass) 
+    final_prompt = (
+    "You are the Lead SOC L3 Analyst. Your objective is to classify a complex cybersecurity incident by correlating the STIX attack timeline with the Neo4j infrastructure graph.\n\n"
+    "ANALYTICAL FRAMEWORK (THINKING PROCESS):\n"
+    "You must analyze the incident not as isolated events, but as a sequence of data flows and actor behaviors. Use the following logic:\n"
+    "1. ACTOR LEGITIMACY: Analyze the IPs in the STIX data against the <neo4j_topology_context>.\n"
+    "   - WARNING: If Neo4j returns actual data for an IP (e.g., 'Server: VM1', 'Zone: External_zone', 'Internal_zone'), this IP is a MANAGED LEGITIMATE ASSET. Do NOT confuse the name 'External_zone' with a rogue actor. It is just a managed DMZ.\n"
+    "   - ONLY an IP that strictly returns 'No topology data found' is an UNKNOWN/ROGUE HACKER.\n"
+    "2. DIRECTION OF INITIATION: Did the SSH/FTP sessions originate from a managed asset targeting another managed asset (typical of automated admin scripts)? Or did the session originate from a ROGUE HACKER targeting a managed asset (Ingress)?\n"
+    "3. DATA LIFECYCLE & EXFILTRATION: Creating database dumps or archiving files in /tmp/ is common admin behavior. However, if a ROGUE HACKER authenticates to the system during or immediately after these files are created, it strongly implies Exfiltration.\n"
+    "4. FALSE POSITIVE CRITERIA: If ALL IPs involved have known Neo4j topology data (Managed Assets), and the actions (DB queries, log reading, file creation) stay strictly between these known assets, deduce that this is BENIGN administrative automation.\n"
+    "5. TRUE POSITIVE CRITERIA: If a ROGUE HACKER ('No topology data found') is present in the logs AND there is evidence of sensitive file creation/modification (DB dumps, config copies), deduce that this is a cyberattack with intent to exfiltrate.\n\n"
+    "FORMAT RULES:\n"
+    "- Do not generate conversational text.\n"
+    "- You MUST strictly follow the structure below.\n\n"
+    "Chain_of_Thought:\n"
+    "- Phase 1 (Actor Analysis): [Identify all IPs. Map them to Neo4j. Explicitly state which are MANAGED ASSETS and which is the ROGUE HACKER. Remember: 'External_zone' means Managed Asset].\n"
+    "- Phase 2 (Vector & Intent): [Analyze the direction of the actions. Who connected to whom? Is it internal lateral movement or an attack by a Rogue Hacker?]\n"
+    "- Phase 3 (Data Flow): [Where did the sensitive files ultimately go? Were they accessed by the Rogue Hacker?]\n\n"
+    "Verdict: [True Positive / False Positive]\n"
+    "Confidence: [e.g., 95%]\n"
+    "MITRE ATT&CK: [e.g., Exfiltration - T1041, Credential Access - T1003 / None]\n"
+    "Context: [1-2 sentences summarizing the graph topology impact on your decision]\n"
+    "Justification: [Max 2 sentences summarizing why it is an attack or benign automation]\n"
+    "Action_Plan:\n"
+    "[If True Positive, provide a precise 3-step response playbook referencing actual IPs and files:]\n"
+    "1. Containment: [e.g., Block rogue IP <IP> on the external firewall]\n"
+    "2. Eradication: [e.g., Delete malicious files like <file_name> and revoke compromised user sessions]\n"
+    "3. Recovery: [e.g., Reset database passwords and audit SSH keys for <user>]\n"
+    "[If False Positive, provide this exact playbook:]\n"
+    "1. Close incident as False Positive.\n"
+    "2. Tune Wazuh rules to whitelist benign automation scripts for the involved internal hosts."
+)
 
-        print(f"[L3-JUDGE] Verdict reached in {(time.time()-start_time):.2f} sec.")
-        return {"messages": [response]}
+    
+    messages_to_pass = [
+        SystemMessage(content=context_prompt),
+        HumanMessage(content=final_prompt)
+    ]
+    
+    start_time = time.time()
+    # Делаем ЕДИНСТВЕННЫЙ вызов ИИ
+    response = llm.invoke(messages_to_pass) 
+
+    print(f"[L3-JUDGE] Verdict reached in {(time.time()-start_time):.2f} sec.")
+    return {"messages": [response]}
 
 # ==========================================
 # МАРШРУТИЗАЦИЯ И СБОРКА ГРАФА
 # ==========================================
 def route_after_extracting(state: IncidentAgentState):
-    # Если скрипт эскалировал инцидент ИЛИ собрал пачку логов (messages)
     if state.get("escalate") or state.get("messages"):
         return "context_aggregator"
     return "end_node"
 
-builder = StateGraph(IncidentAgentState )
+builder = StateGraph(IncidentAgentState)
 builder.add_node('extrtacting', extrtacting)
 builder.add_node('context_aggregator', context_aggregator)
 builder.add_node('hunter_agent', hunter_agent)
 builder.add_node('skeptic_agent', skeptic_agent)
 builder.add_node('judge_agent', judge_agent)
-builder.add_node('tools', ToolNode(tools))
+# Узел 'tools' полностью удален
 
 builder.add_edge(START, "extrtacting")
 
-# Направляем собранную пачку логов напрямую в агрегатор STIX
 builder.add_conditional_edges(
     "extrtacting", 
     route_after_extracting,
@@ -462,59 +553,61 @@ builder.add_conditional_edges(
 builder.add_edge("context_aggregator", "hunter_agent")
 builder.add_edge("hunter_agent", "skeptic_agent")
 builder.add_edge("skeptic_agent", "judge_agent")
-
-# ИСПРАВЛЕНИЕ 2: Явный словарь маршрутизации для инструмента Neo4j
-builder.add_conditional_edges(
-    "judge_agent", 
-    tools_condition,
-    {
-        "tools": "tools",
-        "__end__": END
-    }
-)
-builder.add_edge("tools", "judge_agent")
+# Судья теперь напрямую идет в конец
+builder.add_edge("judge_agent", END)
 
 graph = builder.compile()
 
+
 if __name__ == "__main__":
     print("=" * 60)
-    print("SOC AI V2: BATCHING + GRAPHRAG (THESIS ARCHITECTURE)")
+    print("SOC AI:")
     print("=" * 60)
 
+    total_start_time = time.time()
 
-    while True:
-        try:
-            # Re-initialize all fields to prevent key errors
-            initial_state = {
-                "incedent": [], 
-                "messages": [], 
-                "report": "", 
-                "escalate": False, 
-                "target_ip": "",
-                "stix_bundle": "",
-                "hunter_report": "",
-                "skeptic_report": ""
-            }
-            final_state = graph.invoke(initial_state, {"recursion_limit": 15})
+    try:
+        # Инициализируем пустое состояние
+        initial_state = {
+            "incedent": [], 
+            "messages": [], 
+            "report": "", 
+            "escalate": False, 
+            "target_ip": "",
+            "stix_bundle": "",
+            "hunter_report": "",
+            "skeptic_report": ""
+        }
+        
+        # ЗАПУСКАЕМ ГРАФ ОДИН РАЗ
+        final_state = graph.invoke(initial_state, {"recursion_limit": 15})
+        
+        total_end_time = time.time()
+        total_duration = total_end_time - total_start_time
 
-            if final_state.get("messages") and len(final_state["messages"]) > 0:
-                last_message = final_state["messages"][-1].content
-                if "Verdict:" in last_message: # Убеждаемся, что это финальный отчет
-                    print("\n" + "="*70)
-                    print(">>> OFFICIAL INCIDENT REPORT (L3 JUDGE) <<<".center(70))
-                    print("="*70)
-                    print(last_message)
-                    print("="*70)
+        # Если дошли до финала и есть сообщения, выводим вердикт Судьи
+        if final_state.get("messages") and len(final_state["messages"]) > 0:
+            last_message = final_state["messages"][-1].content
+            if "Verdict:" in last_message: 
+                print("\n" + "="*70)
+                print(">>> OFFICIAL INCIDENT REPORT (L3 JUDGE) <<<".center(70))
+                print("="*70)
+                print(last_message)
+                print("="*70)
+
+                print(f"\n[SYSTEM] TOTAL PROCESSING TIME: {total_duration:.2f} seconds")
+        else:
+            print("\n[SYSTEM] No critical incidents detected in this batch. Graph completed.")
             
-        except KeyboardInterrupt:
-            print("\n[SYSTEM] Shutdown requested by user.")
-            print("[SYSTEM] Flushing Redis database to clear deduplication keys and archives...")
-            try:
-                r_client.flushdb()
-                print("[SYSTEM] Cleanup successful. Goodbye!")
-            except Exception as e:
-                print(f"[ERROR] Cleanup failed: {e}")
-            break
+    except KeyboardInterrupt:
+        print("\n[SYSTEM] Shutdown requested by user.")
+    except Exception as e:
+        print(f"\n[CRITICAL ERROR] {e}")
+    finally:
+        # Всегда очищаем базу Redis перед выходом, чтобы следующий запуск был "чистым"
+        print("\n[SYSTEM] Flushing Redis database to clear deduplication keys and archives...")
+        try:
+            r_client.flushdb()
+            print("[SYSTEM] Cleanup successful. Goodbye!")
         except Exception as e:
-            print(f"\n[CRITICAL ERROR] {e}")
-            time.sleep(5)
+            print(f"[ERROR] Cleanup failed: {e}")

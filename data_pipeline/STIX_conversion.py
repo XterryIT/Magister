@@ -170,6 +170,10 @@ def convert_wazuh_to_stix(raw_log_json):
     ]
     
     if sco_refs:
+        # ДОСТАЕМ "МЯСО" для передачи в агрегатор
+        extracted_path = log_data.get("syscheck", {}).get("path", "")
+        extracted_data = data_block.get("data", "") # В Wazuh тут часто лежат запросы MySQL
+        
         # Упаковываем весь контекст Wazuh внутрь наблюдаемого события
         observed_event = ObservedData(
             first_observed=stix_time,
@@ -180,7 +184,10 @@ def convert_wazuh_to_stix(raw_log_json):
             x_wazuh_rule_id=rule_id,
             x_wazuh_rule_desc=rule_desc,
             x_wazuh_rule_level=rule_level,
-            x_wazuh_full_log=full_log # Обязательно для ИИ (особенно SQL запросы)
+            # Передаем извлеченные детали:
+            x_wazuh_syscheck_path=extracted_path,
+            x_wazuh_data=extracted_data,
+            x_wazuh_full_log=full_log
         )
         stix_objects.append(observed_event)
 

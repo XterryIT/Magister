@@ -3,9 +3,14 @@ import json
 import re
 from datetime import datetime
 from STIX_conversion import convert_wazuh_to_stix
+import time
 
 ALERTS = 'wazuh_raw_alerts'
 
+stix_bundels = []
+all_raw_logs = []
+duplicated_logs = []
+duration_time = 0.0
 
 def deduplication():
     try:
@@ -21,15 +26,18 @@ def deduplication():
     except Exception as e:
         print("something went wrong: {e}")
 
+    start_time = time.time()
 
-    
-    
-    while True:
+    while r.exists(ALERTS):
         # queue is position of our log in Redis, raw_log_string it is a log data
         queue_name, raw_log_string = r.brpop(ALERTS)
+        
+        all_raw_logs.append(raw_log_string)
 
         # Convert json to str
         sample_log = json.loads(raw_log_string)
+
+
 
         # Checks if log converted correctly
         if isinstance(sample_log, str):
@@ -51,13 +59,23 @@ def deduplication():
         if is_new_alert:
             bundle = convert_wazuh_to_stix(sample_log)
 
-            print(bundle.serialize(indent=4))
-            # print(bundle.serialize(indent=4))
+            stix_bundels.append(bundle)
 
         else:
-            print("#########duplicate!!!!!!!!")
+            duplicated_logs.append(log_data)
+
             continue
+        
+    end_time= time.time()
+    duration_time = end_time - start_time
+    return duration_time
 
 
 if __name__ == "__main__":
     deduplication()
+
+    print("===== Deduplication performance =====")
+    print(f"Time performance: {duration_time} s.")
+    print(f"All logs: {len(all_raw_logs)} ")
+    print(f"All STIX logs: {len(stix_bundels )}")
+    print(f"All duplicates: {len(duplicated_logs)}")
