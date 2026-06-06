@@ -26,11 +26,10 @@ from data_pipeline.STIX_conversion import convert_wazuh_to_stix
 # GLOBAL CONFIGURATION
 # ==========================================
 ALERTS_QUEUE = 'wazuh_raw_alerts'
-TIME_WINDOW_SEC = 300  
 HISTORY_WINDOW_SEC = 900 
 ALERT_THRESHOLD = 4
 
-USE_NEO4J = True
+USE_NEO4J = False
 
 r_client = redis.Redis(host='localhost', port=6379, decode_responses=True)
 
@@ -105,27 +104,8 @@ def check_network_topology(ip_addresses_str: str) -> str:
 # ==========================================
 # STAGE 1: EXTRACT, BATCH AND TRIGGER
 # ==========================================
-def check_trigger(ip: str, level: int) -> bool:
-    if not ip or ip == "UNKNOWN_IP":
-        return False
-    if level >= 10:
-        print(f"[TRIGGER] CRITICAL: Alert level {level} for IP {ip}!")
-        return True
 
-    redis_key = f"alert_history:{ip}"
-    current_time = time.time()
-    r_client.zadd(redis_key, {str(current_time): current_time})
-    r_client.zremrangebyscore(redis_key, 0, current_time - TIME_WINDOW_SEC)
-    alert_count = r_client.zcard(redis_key)
-    
-    if alert_count >= ALERT_THRESHOLD:
-        print(f"[TRIGGER] ESCALATION: Accumulated {alert_count}/{ALERT_THRESHOLD} alerts for IP {ip}!")
-        r_client.delete(redis_key) 
-        return True
-    return False
-
-
-def extrtacting(state: IncidentAgentState):
+def extracting(state: IncidentAgentState):
     try:
         r_client.ping()
     except redis.exceptions.ConnectionError:
@@ -133,9 +113,9 @@ def extrtacting(state: IncidentAgentState):
         return {"incedent": [], "messages": [], "escalate": False, "target_ip": ""}
 
     print("\n[SYSTEM] Extracting all available alerts from queue...")
-    
     start_time = time.time()
 
+    # --- 1. ВЫГРЕБАЕМ ВСЕ ЛОГИ ИЗ ОЧЕРЕДИ ---
     raw_logs = []
     while True:
         item = r_client.brpop(ALERTS_QUEUE, timeout=3)
@@ -148,56 +128,59 @@ def extrtacting(state: IncidentAgentState):
         print("[EXTRACT] Queue is empty. No alerts to process.")
         return {"incedent": [], "messages": [], "escalate": False, "target_ip": "UNKNOWN_IP"}
         
-    end_time = time.time()
-    duration_time = end_time - start_time
-
-    print(f"[EXTRACT] Pulled a batch of {len(raw_logs)} alerts from queue in {duration_time} s.")
+    duration_time = time.time() - start_time
+    print(f"[EXTRACT] Pulled a batch of {len(raw_logs)} alerts from queue in {duration_time:.2f} s.")
 
     unique_alerts = []
     needs_escalation = False
-    escalated_ips = set() # СОБИРАЕМ ВСЕ АТАКОВАННЫЕ IP В СПИСОК
+    escalated_ips = set() # Собираем все атакованные IP и IP атакующего
 
+    # --- 2. ОБРАБОТКА И ДЕДУПЛИКАЦИЯ ПАКЕТА ---
     for log_str in raw_logs:
         sample_log = json.loads(log_str)
         log_data = json.loads(sample_log) if isinstance(sample_log, str) else sample_log
 
         raw_id = log_data.get("rule", {}).get("id", "UNKNOWN_RULE")
         level = int(log_data.get("rule", {}).get("level", 0))
-        
-        # 1. IP Агента Wazuh (VM1 или VM2)
         raw_ip = log_data.get("agent", {}).get("ip", "UNKNOWN_IP")
-        
-        # 2. IP Атакующего (Извлекаем Source IP из логов)
         src_ip = log_data.get("data", {}).get("srcip")
         
+        # Запись в архив (нужно для context_aggregator) и сбор IP
         if raw_ip != "UNKNOWN_IP":
             history_key = f"logs_archive:{raw_ip}"
             current_time = time.time()
             r_client.zadd(history_key, {json.dumps(log_data): current_time})
             r_client.zremrangebyscore(history_key, 0, current_time - HISTORY_WINDOW_SEC)
 
-            # Если сработал триггер - добавляем IP в копилку
-            if check_trigger(raw_ip, level):
-                needs_escalation = True
-                # Добавляем сервер-жертву
-                escalated_ips.add(raw_ip)
-                
-                # КРИТИЧЕСКИЙ ФИКС: Добавляем IP хакера (если он есть) в запрос для Neo4j
-                if src_ip and src_ip not in ["127.0.0.1", "0.0.0.0", "localhost", "::1"]:
-                    escalated_ips.add(src_ip)
+            # Собираем IP-адреса для передачи Судье
+            escalated_ips.add(raw_ip)
+            if src_ip and src_ip not in ["127.0.0.1", "0.0.0.0", "localhost", "::1"]:
+                escalated_ips.add(src_ip)
 
+        # ПРАВИЛО ЭСКАЛАЦИИ №1: Критическое событие
+        if level >= 10:
+            print(f"[TRIGGER] CRITICAL EVENT DETECTED: Level {level} for IP {raw_ip}!")
+            needs_escalation = True
+
+        # Дедупликация через Redis (храним ключ 5 минут)
         dedup_key = f"dedup:{raw_id}:{raw_ip}"
         is_new_alert = r_client.set(name=dedup_key, value="1", ex=300, nx=True)
 
         if is_new_alert:
             unique_alerts.append(log_data)
 
-    # Склеиваем все IP через запятую
+    # --- 3. ПРАВИЛО ЭСКАЛАЦИИ №2: Массовость (проверяем уникальные логи) ---
+    if len(unique_alerts) >= ALERT_THRESHOLD:
+        print(f"[TRIGGER] MASSIVE THREAT: {len(unique_alerts)} unique alerts breached the threshold!")
+        needs_escalation = True
+
+    # --- 4. ФОРМИРОВАНИЕ РЕЗУЛЬТАТА ---
     if needs_escalation:
         final_ip_str = ", ".join(list(escalated_ips))
         print(f"[EXTRACT] COMPLEX INCIDENT ESCALATED FOR IPs: {final_ip_str}")
     else:
         final_ip_str = unique_alerts[0].get("agent", {}).get("ip", "UNKNOWN_IP") if unique_alerts else "UNKNOWN_IP"
+        print(f"[EXTRACT] Batch processed. No escalation needed ({len(unique_alerts)} unique alerts).")
 
     return {
         "incedent": [], 
@@ -527,7 +510,7 @@ def judge_agent(state: IncidentAgentState):
 # МАРШРУТИЗАЦИЯ И СБОРКА ГРАФА
 # ==========================================
 def route_after_extracting(state: IncidentAgentState):
-    if state.get("escalate") or state.get("messages"):
+    if state.get("escalate"): 
         return "context_aggregator"
     return "end_node"
 
