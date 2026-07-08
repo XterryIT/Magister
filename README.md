@@ -34,14 +34,14 @@ graph TD
         N[(Neo4j\nNetwork Topology)]
     end
 
-    W -- "Raw JSON Alerts" -->|custom-ai-script.py| R
+    W -- "Raw JSON Alerts (custom script)" --> R
     R -- "brpop" --> D
     D -- "New Alerts" --> S
     S -- "STIX Format" --> T
     T -- "Normal" --> L1
     T -- "Critical / High Volume" --> Esc[Escalate to L2]
     
-    L1 -.-> |"Reads Context"| N
+    L1 -. "Reads Context" .-> N
 ```
 
 ## 🚀 Quick Start
