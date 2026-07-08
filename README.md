@@ -11,37 +11,39 @@
 ## 🏗️ Architecture
 
 ```mermaid
-graph TD
-    subgraph "SIEM"
+flowchart TD
+    subgraph SIEM ["SIEM"]
         W[Wazuh Manager]
     end
 
-    subgraph "Message Broker"
-        R[(Redis Queue\n'wazuh_raw_alerts')]
+    subgraph Broker ["Message Broker"]
+        R[(Redis Queue: wazuh_raw_alerts)]
     end
 
-    subgraph "Data Pipeline"
+    subgraph Pipeline ["Data Pipeline"]
         D[Deduplication Worker]
         S[STIX Converter]
     end
 
-    subgraph "AI Brain (LangGraph)"
+    subgraph Brain ["AI Brain (LangGraph)"]
         T{Smart Trigger\nAlert Thresholding}
         L1[L1 Triage Agent\nQwen 3.5:4b]
+        Esc[Escalate to L2]
     end
 
-    subgraph "Graph Memory"
+    subgraph GraphDB ["Graph Memory"]
         N[(Neo4j\nNetwork Topology)]
     end
 
-    W -- "Raw JSON Alerts (custom script)" --> R
-    R -- "brpop" --> D
-    D -- "New Alerts" --> S
-    S -- "STIX Format" --> T
-    T -- "Normal" --> L1
-    T -- "Critical / High Volume" --> Esc[Escalate to L2]
+    W -->|Raw JSON Alerts| R
+    R -->|brpop| D
+    D -->|New Alerts| S
+    S -->|STIX Format| T
     
-    L1 -. "Reads Context" .-> N
+    T -->|Normal| L1
+    T -->|Critical / High Volume| Esc
+    
+    L1 -.->|Reads Context| N
 ```
 
 ## 🚀 Quick Start
