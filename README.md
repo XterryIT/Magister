@@ -1,20 +1,20 @@
-# 🛡️ Magister (SOC AI Analyst)
+# SOC AI Analyst
 
 Magister is an advanced, automated Security Operations Center (SOC) Analyst powered by Local Large Language Models (LLMs) and built on top of [LangGraph](https://github.com/langchain-ai/langgraph). It ingests security alerts from Wazuh via Redis, standardizes them into STIX 2.1 format, and utilizes a multi-agent debate system (Hunter vs. Skeptic) enriched with Neo4j network topology context to reach highly accurate, autonomous verdicts on potential security incidents.
 
 ---
 
-## ✨ Key Features
+## Key Features
 
-- **🚀 Automated Alert Ingestion & Triage:** Connects to a Redis queue (`wazuh_raw_alerts`) to continuously process, deduplicate, and archive high-volume raw JSON alerts from Wazuh.
-- **🧠 Multi-Agent Reasoning (LangGraph):** Uses a sophisticated graph of AI agents (L2 Hunter, L2 Skeptic, and L3 Judge) that debate the nature of an alert to prevent false positives and identify complex attack chains.
-- **🌐 Network Context Awareness:** Integrates with a **Neo4j Graph Database** that maps your network topology (zones, servers, services, and user privileges). The L3 Judge queries this database to understand lateral movement possibilities before reaching a final verdict.
-- **🕵️ Cyber Threat Intelligence (STIX 2.1):** Automatically converts raw, disparate Wazuh logs into standardized STIX 2.1 bundles (`Identity`, `IPv4Address`, `ObservedData`), ensuring interoperability and structured reasoning.
-- **🔒 Privacy-First Local AI:** Fully compatible with Local LLMs via **Ollama** (e.g., `llama3.1:8b`), ensuring sensitive security logs never leave your infrastructure.
+- ** Automated Alert Ingestion & Triage:** Connects to a Redis queue (`wazuh_raw_alerts`) to continuously process, deduplicate, and archive high-volume raw JSON alerts from Wazuh.
+- ** Multi-Agent Reasoning (LangGraph):** Uses a sophisticated graph of AI agents (L2 Hunter, L2 Skeptic, and L3 Judge) that debate the nature of an alert to prevent false positives and identify complex attack chains.
+- ** Network Context Awareness:** Integrates with a **Neo4j Graph Database** that maps your network topology (zones, servers, services, and user privileges). The L3 Judge queries this database to understand lateral movement possibilities before reaching a final verdict.
+- ** Cyber Threat Intelligence (STIX 2.1):** Automatically converts raw, disparate Wazuh logs into standardized STIX 2.1 bundles (`Identity`, `IPv4Address`, `ObservedData`), ensuring interoperability and structured reasoning.
+- ** Privacy-First Local AI:** Fully compatible with Local LLMs via **Ollama** (e.g., `llama3.1:8b`), ensuring sensitive security logs never leave your infrastructure.
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```mermaid
 graph TD
@@ -57,7 +57,7 @@ graph TD
 
 ---
 
-## 📂 Repository Structure
+## Repository Structure
 
 ```text
 ├── src/
@@ -82,7 +82,7 @@ graph TD
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Prerequisites
 - **Docker & Docker Compose** (for Redis and Neo4j)
@@ -136,5 +136,3 @@ python src/brain/visualize.py
 
 ---
 
-## 🤝 Contributing
-Contributions are welcome! Whether it's adding new agent tools, supporting different SIEM solutions, or improving the STIX 2.1 conversion logic, feel free to open a pull request or issue.
