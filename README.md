@@ -6,11 +6,11 @@ Magister is an advanced, automated Security Operations Center (SOC) Analyst powe
 
 ## Key Features
 
-- ** Automated Alert Ingestion & Triage:** Connects to a Redis queue (`wazuh_raw_alerts`) to continuously process, deduplicate, and archive high-volume raw JSON alerts from Wazuh.
-- ** Multi-Agent Reasoning (LangGraph):** Uses a sophisticated graph of AI agents (L2 Hunter, L2 Skeptic, and L3 Judge) that debate the nature of an alert to prevent false positives and identify complex attack chains.
-- ** Network Context Awareness:** Integrates with a **Neo4j Graph Database** that maps your network topology (zones, servers, services, and user privileges). The L3 Judge queries this database to understand lateral movement possibilities before reaching a final verdict.
-- ** Cyber Threat Intelligence (STIX 2.1):** Automatically converts raw, disparate Wazuh logs into standardized STIX 2.1 bundles (`Identity`, `IPv4Address`, `ObservedData`), ensuring interoperability and structured reasoning.
-- ** Privacy-First Local AI:** Fully compatible with Local LLMs via **Ollama** (e.g., `llama3.1:8b`), ensuring sensitive security logs never leave your infrastructure.
+- **Automated Alert Ingestion & Triage:** Connects to a Redis queue (`wazuh_raw_alerts`) to continuously process, deduplicate, and archive high-volume raw JSON alerts from Wazuh.
+- **Multi-Agent Reasoning (LangGraph):** Uses a sophisticated graph of AI agents (L2 Hunter, L2 Skeptic, and L3 Judge) that debate the nature of an alert to prevent false positives and identify complex attack chains.
+- **Network Context Awareness:** Integrates with a **Neo4j Graph Database** that maps your network topology (zones, servers, services, and user privileges). The L3 Judge queries this database to understand lateral movement possibilities before reaching a final verdict.
+- **Cyber Threat Intelligence (STIX 2.1):** Automatically converts raw, disparate Wazuh logs into standardized STIX 2.1 bundles (`Identity`, `IPv4Address`, `ObservedData`), ensuring interoperability and structured reasoning.
+- **Privacy-First Local AI:** Fully compatible with Local LLMs via **Ollama** (e.g., `llama3.1:8b`), ensuring sensitive security logs never leave your infrastructure.
 
 ---
 
