@@ -1,5 +1,6 @@
 {
     "python.analysis.extraPaths": [
         "./data_pipeline"
-    ]
+    ],
+    "python.defaultInterpreterPath": ".\\venv\\Scripts\\python.exe"
 }
