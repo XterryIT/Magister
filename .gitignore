@@ -1,4 +1,7 @@
+venv/
 myenv/
 __pycache__/
 .langgraph_api/
-/.env
+.env
+.DS_Store
+*.pyc
